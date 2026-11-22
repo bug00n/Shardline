@@ -49,6 +49,19 @@ DELETE user:42
 6.  Эксплуатация backend-систем: конфигурация, логи, метрики,
     профилирование, fault injection.
 
+### Как читать этот документ
+
+В каждом этапе есть блок **«Зачем этот этап»** с объяснением идеи и
+вопросом для самопроверки. Сначала прочитай пояснение и материалы,
+затем реализуй небольшой результат и проверь его по критерию «Готово,
+когда». Если не можешь ответить на вопрос самопроверки, вернись к
+примеру или документации до перехода дальше.
+
+В списках чтения метки означают: **Основа** — прочитать для понимания
+этапа; **Справочник** — использовать при реализации; **Дополнительно**
+— углублённое чтение. Язык источника указан как **RU** или **EN**.
+Перевод книги может отличаться по названию и нумерации глав.
+
 ------------------------------------------------------------------------
 
 ## 1. Границы проекта
@@ -99,11 +112,63 @@ Raft обеспечивает согласованный replicated log **вну
 Для первой версии конфигурация кластера статическая. Перераспределение
 shard'ов и изменение состава Raft-групп --- отдельные поздние этапы.
 
+### Путь записи в готовой системе
+
+```mermaid
+flowchart LR
+    C[Клиент] --> R[Router: key → shard → leader]
+    R --> L[Leader группы]
+    L --> LOG[Запись в Raft log]
+    LOG --> F[Репликация follower-узлам]
+    F --> Q{Подтверждён quorum?}
+    Q -- нет --> E[Ошибка или ожидание; запись не подтверждается]
+    Q -- да --> COMMIT[Запись committed]
+    COMMIT --> FSM[Применение команды к FSM]
+    FSM --> KV[Локальный storage engine]
+    KV --> RESP[Ответ клиенту]
+```
+
+Схема показывает целевой путь для PUT/DELETE одного shard'а. Raft log
+согласует порядок команд между репликами, а storage engine хранит
+состояние FSM локально; это два разных журнала с разными задачами. Если
+клиент не получил ответ из-за таймаута, команда уже могла стать
+committed, поэтому повторный запрос обрабатывается с учётом request ID.
+Чтение в первой версии идёт через leader и должно использовать безопасный
+механизм, описанный на этапе 9. Raft определяет commit по своим правилам:
+quorum необходим, но сам по себе факт копирования записи на большинство
+не всегда достаточен.
+
+### Краткий словарь
+
+| Термин | Значение в Shardline |
+| --- | --- |
+| **Shard** | Часть пространства ключей; для неё выбираются группа реплик и Raft log. |
+| **Replica** | Узел, хранящий копию данных и состояния одной Raft-группы. |
+| **Leader / follower** | Роли внутри группы: leader принимает команды, follower хранит и применяет согласованный log. |
+| **Quorum** | Большинство реплик группы; для трёх реплик это две. |
+| **Committed entry** | Команда Raft log, committed по правилам консенсуса, включая требования к quorum и term, и готовая к применению FSM. |
+| **FSM** | Детерминированная state machine, которая применяет команды PUT/DELETE в одном порядке на репликах. |
+| **Storage WAL** | Локальный append-only журнал для восстановления storage engine; не заменяет Raft log. |
+| **Memtable / SSTable** | Изменяемое состояние в памяти и неизменяемый отсортированный файл в LSM-хранилище. |
+| **Tombstone** | Маркер удаления, который временно скрывает более старое значение в SSTable. |
+| **Snapshot** | Сохранённое состояние FSM, позволяющее восстановиться без повторного проигрывания всего старого log. |
+| **Request ID** | Идентификатор запроса, помогающий распознать повтор после таймаута и не применить его дважды. |
+
 ------------------------------------------------------------------------
 
 # Часть I. Подготовка: Go и backend fundamentals
 
 ## Этап 1. Go для сетевого backend
+
+### Зачем этот этап
+
+Прежде чем собирать storage и сетевой сервер, подготовь основу, на
+которой удобно изолировать ошибки и проверять небольшие части системы.
+Пакеты задают границы кода, `context` — отмену и сроки операций, а тесты
+помогают безопасно менять реализацию по мере усложнения проекта.
+
+**Проверь себя:** можешь ли ты объяснить, кто отменяет операцию с
+`context` и чем ошибка «ключ не найден» отличается от ошибки чтения файла?
 
 ### Изучить
 
@@ -119,17 +184,20 @@ shard'ов и изменение состава Raft-групп --- отдель
 
 ### Почитать
 
--   [A Tour of Go](https://go.dev/tour/)
+-   **Основа · EN:** [A Tour of Go](https://go.dev/tour/)
     -   Methods and interfaces.
     -   Concurrency.
--   [Effective Go](https://go.dev/doc/effective_go)
+-   **Основа · EN:** [Go tutorials](https://go.dev/doc/tutorial/) ---
+    официальные вводные уроки по модулям, тестам и инструментам.
+-   **На русском · RU:** [Go на русском](https://goru.dev/learn) ---
+    переводные материалы и ссылки на интерактивный тур; сверяй детали с
+    оригинальной документацией.
+-   **Дополнительно · EN:** [Effective Go](https://go.dev/doc/effective_go)
     -   Errors.
     -   Concurrency.
--   [Go blog: Context](https://go.dev/blog/context)
--   [Go blog: io package](https://go.dev/blog/laws-of-reflection) ---
-    как дополнительный материал; основной ориентир по интерфейсам ---
-    документация `io`.
--   [Go package documentation](https://pkg.go.dev/)
+-   **Справочник · EN:** [Go blog: Context](https://go.dev/blog/context),
+    [пакет `io`](https://pkg.go.dev/io) (`Reader`/`Writer`) и
+    [документация пакетов Go](https://pkg.go.dev/).
 
 ### Реализовать
 
@@ -157,6 +225,18 @@ shard'ов и изменение состава Raft-групп --- отдель
 
 ## Этап 2. Базовый KV engine в памяти
 
+### Зачем этот этап
+
+Сначала зафиксируй смысл `Get`, `Put` и `Delete` без файлов и сети. Так
+последующие WAL и TCP-обработчик будут опираться на ясный контракт, а
+не каждый задавать собственное поведение. Mutex защищает общее состояние
+от одновременного доступа; tombstone сохраняет факт удаления, который
+позже понадобится при чтении старых версий из LSM-файлов.
+
+**Проверь себя:** если `Put(k)` и `Delete(k)` выполняются одновременно,
+какое наблюдаемое состояние допустимо и как вызывающий код поймёт, что
+ключа нет?
+
 ### Изучить
 
 -   Что такое key-value storage.
@@ -170,9 +250,10 @@ shard'ов и изменение состава Raft-групп --- отдель
 
 ### Почитать
 
--   [Go: sync package](https://pkg.go.dev/sync)
--   [Go: map type](https://go.dev/blog/maps)
--   *Designing Data-Intensive Applications*, Martin Kleppmann:
+-   **Основа · EN:** [Go: sync package](https://pkg.go.dev/sync) и
+    [Go: maps](https://go.dev/blog/maps).
+-   **Дополнительно · EN / RU-перевод:** *Designing Data-Intensive
+    Applications*, Martin Kleppmann:
     -   Chapter 1 --- Reliable, Scalable, and Maintainable Applications.
     -   Chapter 3 --- Storage and Retrieval (в первую очередь обзор
         способов хранения).
@@ -198,6 +279,19 @@ shard'ов и изменение состава Raft-групп --- отдель
 
 ## Этап 3. WAL --- журнал операций
 
+### Зачем этот этап
+
+Map пропадает вместе с процессом. WAL позволяет восстановить её:
+операция кодируется в запись журнала, добавляется в файл и затем
+применяется к состоянию. При старте журнал проигрывается снова. Политика
+`Sync` определяет, какие подтверждённые записи переживут отключение
+питания; неполную последнюю запись можно отличить от повреждения в
+середине журнала.
+
+**Проверь себя:** в какой момент PUT считается успешным при выбранной
+политике синхронизации и что восстановление должно сделать с обрезанным
+хвостом WAL?
+
 ### Изучить
 
 -   Зачем базе данных write-ahead log.
@@ -212,11 +306,11 @@ shard'ов и изменение состава Raft-групп --- отдель
 
 ### Почитать
 
--   *Designing Data-Intensive Applications*:
+-   **Основа · EN / RU-перевод:** *Designing Data-Intensive Applications*:
     -   Chapter 3 --- Log-structured storage.
--   [Go os.File](https://pkg.go.dev/os#File)
--   [Go encoding/binary](https://pkg.go.dev/encoding/binary)
--   [SQLite: Write-Ahead Logging](https://www.sqlite.org/wal.html) ---
+-   **Справочник · EN:** [Go `os.File`](https://pkg.go.dev/os#File) и
+    [Go `encoding/binary`](https://pkg.go.dev/encoding/binary).
+-   **Основа · EN:** [SQLite: Write-Ahead Logging](https://www.sqlite.org/wal.html) ---
     изучить идею и порядок действий, не копировать архитектуру SQLite
     целиком.
 
@@ -247,6 +341,17 @@ shard'ов и изменение состава Raft-групп --- отдель
 
 ## Этап 4. LSM: Memtable и SSTable
 
+### Зачем этот этап
+
+WAL нужен для восстановления, но сам по себе превращается в длинную
+историю записей. LSM добавляет изменяемую memtable для свежих значений и
+неизменяемые отсортированные SSTable для сброса на диск. Чтение ищет
+ключ в нескольких местах и выбирает самую новую версию; compaction
+объединяет файлы и убирает устаревшие версии, когда это безопасно.
+
+**Проверь себя:** если в memtable есть новое значение, а в старой
+SSTable — предыдущее, какое должно вернуть `Get` и по какому признаку?
+
 ### Изучить
 
 -   Почему случайные записи на диск дорогие.
@@ -261,12 +366,12 @@ shard'ов и изменение состава Raft-групп --- отдель
 
 ### Почитать
 
--   *Designing Data-Intensive Applications*:
+-   **Основа · EN / RU-перевод:** *Designing Data-Intensive Applications*:
     -   Chapter 3 --- разделы про LSM-trees, SSTables, compaction.
--   [LevelDB implementation
+-   **Основа · EN:** [LevelDB implementation
     notes](https://github.com/google/leveldb/blob/main/doc/impl.md)
--   [RocksDB
-    overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview)
+-   **Дополнительно · EN:** [RocksDB
+    overview](https://github.com/meta/rocksdb/wiki/RocksDB-Overview)
 
 ### Реализовать
 
@@ -298,6 +403,17 @@ Put/Delete/flush/compaction/restart и после восстановления �
 
 ## Этап 5. Надёжность локального storage
 
+### Зачем этот этап
+
+Даже правильные WAL и SSTable могут дать неверный результат, если
+процесс упадёт между публикацией нового файла и удалением старого.
+Manifest фиксирует, какие файлы составляют актуальное состояние.
+Безопасный порядок записи должен оставлять после каждого возможного
+сбоя либо прежнее целое состояние, либо новое целое состояние.
+
+**Проверь себя:** что увидит recovery, если процесс упал после записи
+нового SSTable, но до обновления manifest?
+
 ### Изучить
 
 -   Atomic file replacement и безопасная публикация новых файлов.
@@ -310,10 +426,11 @@ Put/Delete/flush/compaction/restart и после восстановления �
 
 ### Почитать
 
--   [Go testing package](https://pkg.go.dev/testing)
--   [Go fuzzing tutorial](https://go.dev/doc/tutorial/fuzz)
--   *Designing Data-Intensive Applications*, Chapter 8 --- Faults and
-    Partial Failures (пока обзорно).
+-   **Основа · EN:** [Go testing package](https://pkg.go.dev/testing) и
+    [Go fuzzing tutorial](https://go.dev/doc/tutorial/fuzz).
+-   **Дополнительно · EN / RU-перевод:** *Designing Data-Intensive
+    Applications*, Chapter 8 --- Faults and Partial Failures (пока
+    обзорно).
 
 ### Реализовать
 
@@ -340,6 +457,17 @@ Put/Delete/flush/compaction/restart и после восстановления �
 
 ## Этап 6. TCP server и собственный протокол
 
+### Зачем этот этап
+
+TCP доставляет поток байтов и не сохраняет границы запросов. Поэтому
+клиент и сервер должны договориться о framing, типе сообщения и лимите
+размера, а сервер — дочитать заголовок и payload даже при частичном
+`Read`. На этом этапе клиент впервые использует storage другого процесса.
+
+**Проверь себя:** если заголовок пришёл двумя частями, откуда сервер
+узнает, когда можно декодировать сообщение, и как он защитится от
+вредоносной длины payload?
+
 ### Изучить
 
 -   TCP --- поток байтов, а не сообщения.
@@ -355,12 +483,12 @@ Put/Delete/flush/compaction/restart и после восстановления �
 
 ### Почитать
 
--   [Go net package](https://pkg.go.dev/net)
--   [Go io package](https://pkg.go.dev/io)
--   [Go bufio package](https://pkg.go.dev/bufio)
--   *Computer Networking: A Top-Down Approach*:
+-   **Справочник · EN:** [Go `net`](https://pkg.go.dev/net),
+    [Go `io`](https://pkg.go.dev/io) и [Go `bufio`](https://pkg.go.dev/bufio).
+-   **Основа · EN / RU-перевод:** *Computer Networking: A Top-Down
+    Approach*:
     -   Chapter 3 --- Transport Layer (TCP).
--   [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/)
+-   **Дополнительно · EN:** [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/).
 
 ### Реализовать
 
@@ -389,6 +517,17 @@ payload. - Не доверяй длине, которую прислал кли�
 
 ## Этап 7. Конкурентная обработка и lifecycle узла
 
+### Зачем этот этап
+
+Множество подключений означает множество одновременно выполняющихся
+обработчиков и ресурсов, которыми кто-то должен владеть. Ограничения,
+отмена и последовательность shutdown предотвращают неограниченный рост
+работы, утечки goroutine и закрытие файлов посреди операции. Это
+применяется и к сетевому серверу, и к фоновым задачам storage.
+
+**Проверь себя:** кто прекращает каждую долгоживущую goroutine и что
+происходит с активной записью при начале shutdown?
+
 ### Изучить
 
 -   Goroutine per connection и worker pool: компромиссы.
@@ -402,10 +541,10 @@ payload. - Не доверяй длине, которую прислал кли�
 
 ### Почитать
 
--   [Go: Pipelines and cancellation](https://go.dev/blog/pipelines)
--   [Go: Race detector](https://go.dev/doc/articles/race_detector)
--   [Go: context](https://pkg.go.dev/context)
--   [Go: net/http server
+-   **Основа · EN:** [Go: Pipelines and cancellation](https://go.dev/blog/pipelines)
+    и [Go: Race detector](https://go.dev/doc/articles/race_detector).
+-   **Справочник · EN:** [Go `context`](https://pkg.go.dev/context) и
+    [Go `net/http` server
     shutdown](https://pkg.go.dev/net/http#Server.Shutdown) --- изучить
     lifecycle как пример.
 
@@ -437,6 +576,18 @@ goroutine.
 
 ## Этап 8. Распределённая система без консенсуса
 
+### Зачем этот этап
+
+Теперь запросы и данные размещаются на нескольких процессах, а сетевой
+таймаут не позволяет точно отличить упавший узел от медленного. Здесь
+разделяются две задачи: shard определяет, куда направить ключ, а
+репликация копирует изменения. Простая репликация этого этапа нужна для
+понимания отказов и маршрутизации, но не даёт гарантий Raft и не должна
+выдаваться за strong consistency.
+
+**Проверь себя:** почему отсутствие heartbeat не доказывает, что узел
+умер, и почему consistent hashing само по себе не согласует записи?
+
 ### Изучить
 
 -   Что меняется, когда данные и процессы находятся на разных машинах.
@@ -452,13 +603,16 @@ goroutine.
 
 ### Почитать
 
--   *Designing Data-Intensive Applications*:
+-   **Основа · EN / RU-перевод:** *Designing Data-Intensive Applications*:
     -   Chapter 5 --- Replication.
     -   Chapter 6 --- Partitioning.
     -   Chapter 8 --- The Trouble with Distributed Systems.
--   [The Raft paper](https://raft.github.io/raft.pdf) --- пока прочитать
+-   **Основа · EN:** [MIT 6.5840: Distributed Systems](https://pdos.csail.mit.edu/6.5840/) ---
+    выбирай лекции и лабораторные по мере готовности к распределённым
+    системам.
+-   **Основа · EN:** [The Raft paper](https://raft.github.io/raft.pdf) --- пока прочитать
     introduction и разделы о проблеме консенсуса.
--   [Raft visualization](https://raft.github.io/)
+-   **Справочник · EN:** [Raft visualization](https://raft.github.io/).
 
 ### Реализовать
 
@@ -487,6 +641,19 @@ peer.
 
 ## Этап 9. Raft --- консенсус внутри shard
 
+### Зачем этот этап
+
+У каждой группы shard'а должен быть общий подтверждённый порядок
+команд, даже когда часть узлов недоступна. Raft выбирает leader и
+считает запись committed по своим правилам: в частности, с учётом quorum
+и term. При потере quorum система сохраняет безопасность, отказываясь
+подтверждать новые записи. Это строже, чем просто отправить запрос
+нескольким репликам.
+
+**Проверь себя:** чем отличаются локально записанная, реплицированная и
+committed запись, и почему старый изолированный leader не может
+подтвердить новую запись?
+
 ### Изучить
 
 -   Replicated state machine.
@@ -504,7 +671,7 @@ peer.
 
 ### Почитать
 
-1.  *In Search of an Understandable Consensus Algorithm (Raft)*:
+1.  **Основа · EN:** [In Search of an Understandable Consensus Algorithm (Raft)](https://raft.github.io/raft.pdf):
     -   §2 Replicated state machine.
     -   §3 Understandability.
     -   §5 Raft basics.
@@ -512,8 +679,7 @@ peer.
     -   §5.3 Log replication.
     -   §5.4 Safety.
     -   §7 Cluster membership --- только после базовой реализации.
-2.  [Raft visualization](https://raft.github.io/)
-3.  [Raft paper](https://raft.github.io/raft.pdf)
+2.  **Справочник · EN:** [Raft visualization](https://raft.github.io/).
 
 Читать paper лучше параллельно с реализацией: сначала разобраться с
 одной гарантией, затем проверить её в коде.
@@ -556,6 +722,17 @@ log, переживают падение leader и сохраняют safety п�
 
 ## Этап 10. Соединяем Raft и storage engine
 
+### Зачем этот этап
+
+Raft решает, какие команды и в каком порядке можно применить; FSM
+превращает committed-команды в изменения ключей. После рестарта
+состояние восстанавливается из snapshot и committed log, а локальный
+storage engine сохраняет результат применения. Повтор запроса после
+таймаута важен: клиент мог не получить ответ на уже committed PUT.
+
+**Проверь себя:** чем Raft log отличается от storage WAL и как request ID
+помогает при повторе запроса, который мог успеть commit-иться?
+
 ### Изучить
 
 -   State machine application.
@@ -568,11 +745,12 @@ log, переживают падение leader и сохраняют safety п�
 
 ### Почитать
 
--   Raft paper, разделы о log replication и safety.
--   *Designing Data-Intensive Applications*, Chapter 9 --- Consistency
-    and Consensus.
--   Документация и design notes etcd Raft --- для сравнения
-    архитектурных решений, не для копирования реализации.
+-   **Основа · EN:** [Raft paper](https://raft.github.io/raft.pdf),
+    разделы о log replication и safety.
+-   **Дополнительно · EN / RU-перевод:** *Designing Data-Intensive
+    Applications*, Chapter 9 --- Consistency and Consensus.
+-   **Справочник · EN:** [Документация etcd Raft](https://github.com/etcd-io/raft) ---
+    для сравнения архитектурных решений, не для копирования реализации.
 
 ### Реализовать
 
@@ -600,6 +778,18 @@ majority, применяется к storage и остаётся доступны
 
 ## Этап 11. Несколько shard'ов и маршрутизация
 
+### Зачем этот этап
+
+Одна Raft-группа обслуживает один shard. Несколько независимых групп
+позволяют разделить ключи и нагрузку: router вычисляет shard по ключу,
+находит его группу и отправляет запрос её leader. Фиксированная карта
+позволяет сначала проверить маршрутизацию, не решая одновременно
+сложную задачу миграции данных при изменении числа shard'ов.
+
+**Проверь себя:** почему маршрутизатор должен выбирать leader именно
+группы найденного shard'а и что останется доступно, если другая группа
+недоступна?
+
 ### Изучить
 
 -   Partition map.
@@ -613,10 +803,10 @@ majority, применяется к storage и остаётся доступны
 
 ### Почитать
 
--   *Designing Data-Intensive Applications*:
+-   **Основа · EN / RU-перевод:** *Designing Data-Intensive Applications*:
     -   Chapter 6 --- Partitioning.
--   Материалы Raft paper по membership --- только после понимания
-    базового Raft.
+-   **Дополнительно · EN:** [Материалы Raft paper по membership](https://raft.github.io/raft.pdf) ---
+    только после понимания базового Raft.
 
 ### Реализовать
 
@@ -640,6 +830,17 @@ shard не должна автоматически ломать запросы �
 
 ## Этап 12. Failure testing и эксплуатация
 
+### Зачем этот этап
+
+Работающая система должна не только хранить данные, но и показывать,
+что происходит при нагрузке и отказах. Логи помогают восстановить
+последовательность событий, метрики — увидеть частоту и задержки,
+профили — найти узкое место, а воспроизводимый fault injection —
+проверить поведение при сбое.
+
+**Проверь себя:** какие данные помогут отличить медленное хранилище от
+сетевой задержки и как повторить один и тот же сценарий отказа?
+
 ### Изучить
 
 -   Fault injection.
@@ -654,11 +855,11 @@ shard не должна автоматически ломать запросы �
 
 ### Почитать
 
--   [Go diagnostics](https://go.dev/doc/diagnostics)
--   [Go pprof](https://pkg.go.dev/net/http/pprof)
--   [Prometheus
+-   **Основа · EN:** [Go diagnostics](https://go.dev/doc/diagnostics) и
+    [Go `pprof`](https://pkg.go.dev/net/http/pprof).
+-   **Справочник · EN:** [Prometheus
     instrumentation](https://prometheus.io/docs/guides/go-application/)
--   [Docker Compose](https://docs.docker.com/compose/)
+    и [Docker Compose](https://docs.docker.com/compose/).
 
 ### Реализовать
 
